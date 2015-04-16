@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import requests
+from bs4 import BeautifulSoup
+import MySQLdb as mysql
+import sys, warnings
+from time import sleep
+from random import random
+from tempfile import mkstemp
+from shutil import copyfileobj
+from os import unlink, close
+
+
+
+DEBUG = False
+USER = ''
+DATABASE = ''
+PASSWORD = ''
+HOST = '127.0.0.1'
+PORT = 3306
+TABLE = 'events'
+
+
+Eventbrite_category = ['business', 'other', 'science-and-tech', 'health', 'family-and-education', 'music', 'travel-and-outdoor',\
+    'hobbies', 'arts', 'fashion', 'food-and-drink', 'government']
+Eventbrite_country = ['turkey--i̇stanbul','united-kingdom', 'usa', 'germany', 'france', 'spain']
+Eventbrite_type = ['events', 'conferences']
+Eventbrite_URL = 'https://www.eventbrite.com/d/%s/%s--%s/'
+
+Meetup_category = ['arts-culture', 'career-business', 'cars-motorcycles', 'community-environment', 'dancing', \
+'education-learning', 'fashion-beauty', 'fitness', 'food-drink', 'games', 'health-wellbeing', 'hobbies-crafts', \
+'lgbt', 'language', 'lifestyle', 'literature-writing', 'government-politics', 'movies-film', 'music', 'new-age-spirituality', \
+'outdoors-adventure','paranormal', 'parents-family', 'pets-animals', 'photography', 'religion-beliefs', 'sci-fi-fantasy', \
+'singles', 'socializing', 'sports-recreation', 'support', 'tech', 'women']
+Meetup_URL = 'http://www.meetup.com/find/events/{0}/?allMeetups=false&radius=5&userFreeform=Istanbul%2C+Turkey'
+
+DB_CREATE = '''
+    create table if not exists events (
+    id int not null auto_increment, 
+    name varchar(255) not null,
+    logo mediumblob not null,
+    date varchar(100) not null,
+    hour varchar(100) not null,
+    category varchar(255) not null,
+    venue varchar(255) not null,
+    location varchar(255) not null,
+    website varchar(255) not null,
+    contact varchar(255) not null,
+    description text not null,
+    primary key (`id`)
+    ) engine=innodb charset=utf8;
+'''
+months={'January':'01', 'February':'02', 'March':'03', 'April':'04', 'May':'05', 'June':'06', 'July':'07',\
+            'August':'08', 'September':'09', 'October':'10', 'November':'11', 'December':'12' }
+
+class EventHandler(object):
+    """basic class for handling events"""
+    def __init__(self, url):
+        self.start_url = url
+        self.error = False
+
+        try:
+            self.con = mysql.connect(HOST, USER, PASSWORD, DATABASE, charset = 'utf8')
+            self.cursor = self.con.cursor()
+        except mysql.err.OperationalError:
+            print "Error connecting to database"
+            sys.exit(1)
+
+    def __del__(self):
+        try:
+            self.cursor.close()
+        except AttributeError:
+            pass
+
+    def add_event(self):
+        
+        self.cursor.execute('INSERT INTO events (name,logo,date,hour, category, venue, location, website, contact, description) \
+            VALUES ("%(event_name)s", "%(event_logo)s", "%(event_date)s", "%(event_time)s", "%(event_category)s",\
+             "%(event_venue)s","%(event_location)s","%(event_website)s","%(event_contact)s","%(event_description)s");', self.d)
+        self.con.commit()
+
+    def db_cleanup(self): 
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            self.cursor.execute(DB_CREATE)
+        self.cursor.execute('DELETE FROM events;')
+        self.con.commit()
+
+    def logo_fetch(self):
+        try:
+            img = requests.get(self.d['event_logo'], stream = True)
+        except requests.exceptions.MissingSchema: 
+            return
+        if not img.ok:
+            return 
+        fd, tmpfile = mkstemp()
+        close(fd)
+
+        with open(tmpfile, 'wb') as f:
+            copyfileobj(img.raw, f)
+        with open(tmpfile, 'rb') as f:
+            data = mysql.Binary(f.read())
+        self.d['event_logo'] = data
+        unlink(tmpfile)
+
+
+class MashableHandler(EventHandler):
+
+    def date_convertion(self, date1):
+        date1 = date1.split(' ')
+        seq = [date1[1], months[date1[0]],date1[2]]
+        return ('/').join(seq)
+
+    def scrape_url(self, url):
+        doc = requests.get(url)
+        if doc.ok:
+            soup = BeautifulSoup(doc.text.encode('utf-8'))
+        else:
+            if DEBUG:
+                print 'code error: %s' % doc.status_code
+            self.error = True
+            return
+
+        d={}
+
+        try: 
+            d['event_contact'] = soup('dd')[6].text.strip()
+            d['event_name'] = soup.h1.text
+            d['event_logo'] = soup('div', 'event-image float-left')[0].findChildren()[0].attrs['src']
+            d['event_date'] = self.date_convertion(soup('dd')[2].text.strip())
+            d['event_time'] = 'N/A'
+            d['event_category'] = soup('div','event-info-theme')[0].text.strip()
+            d['event_venue'] = soup('dd')[4].text.strip()
+            d['event_location'] = soup('div','event-info-location')[0].text.strip()
+            d['event_website'] = soup('dd')[5].text.strip()
+            d['event_description'] = soup('div','event-html')[0].text.strip().replace('\n',' ')
+        except:
+            d['event_contact'] = soup('dd')[5].text.strip()
+            d['event_name'] = soup.h1.text
+            d['event_logo'] = soup('div', 'event-image float-left')[0].findChildren()[0].attrs['src']
+            d['event_date'] = self.date_convertion(soup('dd')[2].text.strip())
+            d['event_time'] = 'N/A'
+            d['event_category'] = soup('div','event-info-theme')[0].text.strip()
+            d['event_venue'] = soup('dd')[0].text.strip()
+            d['event_location'] = soup('div','event-info-location')[0].text.strip()
+            d['event_website'] = soup('dd')[4].text.strip()
+            d['event_description'] = soup('div','event-html')[0].text.strip().replace('\n',' ')
+
+        
+        self.d = d
+
+    def get_urls(self):
+        doc = requests.get(self.start_url)
+        if doc.ok:
+            soup = BeautifulSoup(doc.text.encode('utf-8'))
+        else:
+            if DEBUG:
+                print 'code error: %s' % doc.status_code
+
+        list_pages = []
+        self.urls=[]
+
+        for tag in soup.find('div','paging').findChildren():
+            try:
+                list_pages.append(tag.attrs['href'])
+            except KeyError:
+                continue
+
+        for page in list_pages: 
+        
+            doc = requests.get(page)
+            if doc.ok:
+                soup = BeautifulSoup(doc.text.encode('utf-8'))
+            else:
+                if DEBUG:
+                    print 'code error: %s' % doc.status_code
+
+            for i in soup.select('div > h3 > a'):
+                if i.attrs['href'] not in self.urls:
+                    self.urls.append(i.attrs['href'])
+            sleep(random())
+
+
+
+    def process(self):
+        self.get_urls()
+        for url in self.urls:
+            self.scrape_url(url)
+            if not self.error:
+                self.logo_fetch()
+                self.add_event()
+            sleep(random())
+
+
+class EventbriteHandler(EventHandler):
+
+    def scrape_url(self, url, category, img, event_date):
+        doc = requests.get(url)
+        if doc.ok:
+            soup = BeautifulSoup(doc.text.encode('utf-8'))
+        else:
+            if DEBUG:
+                print 'code error: %s' % doc.status_code
+            self.error = True
+
+        d={}
+        try:
+            d['event_name'] = soup.h1.text
+        except:
+            d['event_name'] = 'N/A'
+            print 'name', url
+
+        d['event_logo'] = img
+        d['event_date'] = event_date.split('T')[0].replace('-','/')
+        d['event_time'] = event_date.split('T')[1][:-3]
+
+        try: 
+            d['event_category'] = category
+        except:
+            d['event_category'] = 'N/A'
+        try:
+            d['event_venue'] = soup('span','fn org')[0].text.strip()
+        except:
+            d['event_venue'] = 'N/A'
+        try:
+            d['event_location'] = soup('span','locality')[0].text.strip()
+        except:
+            d['event_location'] = 'N/A'
+        try:
+            d['event_website'] = soup.select('#organizer_website > a')[0].attrs['href']
+        except IndexError:
+            d['event_website'] = 'N/A'
+
+        d['event_contact'] = 'N/A'
+
+        try:
+            d['event_description'] = soup('span','description')[0].text.strip().replace('\n',' ')
+        except:
+            d['event_description'] = 'N/A'
+
+        self.d = d
+
+    def get_urls(self):
+
+        dict_url = {}
+        self.urls = {}
+
+        for category  in Eventbrite_category:
+            if category  not in dict_url:
+                dict_url[category] = [Eventbrite_URL % (Eventbrite_country[0], category, Eventbrite_type[0])]   
+                self.urls[category] = []   
+            else:
+                dict_url[category].append(Eventbrite_URL % (Eventbrite_country[0], category, Eventbrite_type[0]))
+
+        for countrynum in range(1,6):
+            for category in ['business', 'science-and-tech']:
+                if category not in dict_url:
+                    dict_url[category] = [Eventbrite_URL % (Eventbrite_country[countrynum], category, Eventbrite_type[1])]        
+                else:
+                    dict_url[category].append(Eventbrite_URL % (Eventbrite_country[countrynum], category, Eventbrite_type[1]))
+
+        for category in dict_url:
+            for url in dict_url[category]:
+                doc = requests.get(url)
+                if doc.ok:
+                    soup = BeautifulSoup(doc.text.encode('utf-8'))
+                else:
+                    if DEBUG:
+                        print 'code error: %s' % doc.status_code
+
+                url_page = url+'?crt=regular&page=%s'
+                page_list = []
+
+                try:
+                    last_page = int(soup.find('li', 'js-page-link show-large').text.strip('\n'))
+                    for i in range(1, last_page):
+                        page_list.append(url_page % str(i))
+                except:
+                    try:
+                        pages1=soup.find_all('li','js-page-link')
+                        for p in pages1:
+                            p.findChildren([0]).text
+                            page_list.append(url_page % p)
+                    except:
+                        page_list.append(url)
+
+                for page in page_list:
+                    doc1 = requests.get(page)
+                    if doc1.ok:
+                        soup1 = BeautifulSoup(doc1.text.encode('utf-8'))
+                    else:
+                        if DEBUG:
+                            print 'code error: %s' % doc1.status_code
+
+                    divs = soup1.find_all('div', 'l-block-2')
+                    for div in divs:
+                        try:
+                            url = div.find('a','js-search-result-click-action event-card l-media clrfix').attrs['href']
+                        except Exception, e:
+                            continue
+                        img = div.find('img','js-d-retina').attrs['src']
+                        if not img.startswith('http'): img = 'http:' + img
+                        event_date = div.find('span','event-card__details text--truncated').attrs['datetime']
+                        self.urls[category].append([url, img, event_date])
+
+                    sleep(random())
+
+
+    def process(self):
+        self.get_urls()
+        if DEBUG: print 'Gathered urls for %s' % self.__class__.__name__
+        for category in self.urls:
+            for event in self.urls[category]:
+                self.scrape_url(event[0], category, event[1], event[2])
+                if not self.error:
+                    self.logo_fetch()
+                    self.add_event()
+                sleep(random())
+
+
+class MeetupHandler(EventHandler):
+
+    def scrape_url(self, url, category):
+        doc = requests.get(url)
+        if doc.ok:
+            soup = BeautifulSoup(doc.text.encode('utf-8'))
+        else:
+            if DEBUG:
+                print 'code error: %s' % doc.status_code
+
+        d={}
+        d['event_name'] =soup.h1.text.strip()
+        try:
+            d['event_logo'] = soup('a', 'block meta-gphoto align-center margin-top')[0].findChildren()[0].attrs['src']
+        except:
+            d['event_logo'] = 'N/A'
+        try:
+            d['event_date'] = soup('time')[0].attrs['datetime'].split('T')[0].replace('-','/')   
+        except: 
+            d['event_date'] = 'N/A'
+        try:
+            d['event_time'] = soup('time')[0].attrs['datetime'].split('T')[1][0,5]
+        except:
+            d['event_time'] = 'N/A'
+        d['event_category'] = category
+        d['event_venue'] = soup.select('h3 > a')[0].text.strip()
+        d['event_location'] = soup('span','locality')[0].text
+        d['event_website'] = 'N/A'
+        d['event_contact'] = 'N/A'
+        try:
+            d['event_description'] = soup('div', 'line redactor-description')[0].text
+        except:
+            d['event_description'] = 'N/A'
+        self.d = d
+
+    def get_urls(self):
+
+        self.urls = {}
+
+        for category in Meetup_category:
+            doc = requests.get(Meetup_URL.format(category))
+            self.urls[category] = []
+            if doc.ok:
+                soup = BeautifulSoup(doc.text.encode('utf-8'))
+            else:
+                if DEBUG:
+                    print 'code error: %s' % doc.status_code
+            
+            for tag in soup.find_all('div','unit size4of7'):
+                if 'event' in tag.findChildren()[3].attrs['href']:
+                    self.urls[category].append(tag.findChildren()[3].attrs['href'])
+
+            sleep(random())
+
+    def process(self):
+        self.get_urls()
+        if DEBUG: print 'Gathered urls for %s' % self.__class__.__name__
+        for category in self.urls:
+            for url in self.urls[category]:
+                self.scrape_url(url, category)
+                if not self.error:
+                    self.logo_fetch()
+                    self.add_event()
+            sleep(random())
+
+
+def main():
+
+    mashable = MashableHandler('http://events.mashable.com/')
+    mashable.db_cleanup()
+    mashable.process()
+    
+    meetup = MeetupHandler('')
+    meetup.process()
+    
+    eventbrite = EventbriteHandler('')
+    eventbrite.process()
+    
+
+if __name__ == "__main__":
+    main()
